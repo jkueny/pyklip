@@ -259,7 +259,7 @@ class DiskFM(NoFM):
                         self.aligned_center,
                         flipx=True,
                     )
-                    model_copy[np.where(np.isnan(model_copy))] = 0.0
+                    model_copy[np.isnan(model_copy)] = 0.0
                     self.model_disks[k * n_wv_per_file + j, :, :] = model_copy
 
         else:  # This is a 2D disk model and a wl = 1 case
@@ -270,7 +270,7 @@ class DiskFM(NoFM):
                                     pa_here,
                                     self.aligned_center,
                                     flipx=True)
-                model_copy[np.where(np.isnan(model_copy))] = 0.0
+                model_copy[np.isnan(model_copy)] = 0.0
                 self.model_disks[i] = model_copy
 
         self.model_disks = np.reshape(
@@ -382,10 +382,10 @@ class DiskFM(NoFM):
 
         # use the disk model stored
         model_sci = self.model_disks[input_img_num, section_ind[0]]
-        model_sci[np.where(np.isnan(model_sci))] = 0
+        model_sci[np.isnan(model_sci)] = 0
         model_ref = self.model_disks[ref_psfs_indicies, :]
         model_ref = model_ref[:, section_ind[0]]
-        model_ref[np.where(np.isnan(model_ref))] = 0
+        model_ref[np.isnan(model_ref)] = 0
         if mode == 'RDI':
             #if only RDI we skip the deltaKL calculation since we do only over-subctraction
             delta_KL = klmodes * 0.
