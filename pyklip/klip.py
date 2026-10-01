@@ -6,6 +6,51 @@ import scipy.interpolate as sinterp
 from scipy.stats import t
 import warnings
 
+import cv2
+
+import numba
+
+@numba.jit(fastmath=True, parallel=False)
+def bilinear_interpolate(input_img, y_coords, x_coords):
+    """
+    Perform bilinear interpolation for a set of x and y coordinates in a given 2D array.
+
+    Parameters:
+    - input_img: The source 2D array (image) from which to interpolate values.
+    - y_coords: The y coordinates at which to interpolate.
+    - x_coords: The x coordinates at which to interpolate.
+
+    Returns:
+    - Interpolated values at the specified coordinates.
+    """
+    # Initialize the output array with NaNs, which will remain for out-of-bounds coordinates
+    output = np.empty(y_coords.shape, dtype=np.float32)
+    print(y_coords.shape)
+    output.fill(np.nan)
+
+    height, width = input_img.shape
+
+    for i in range(x_coords.shape[0]):
+        x, y = x_coords[i], y_coords[i]
+
+        # Check if the coordinates are within the bounds of the input image
+        if (x >= 0) and (x < width - 1) and (y >= 0) and (y < height - 1):
+            x_floor, y_floor = np.floor(x,dtype=int), np.floor(y,dtype=int)
+            x_ceil, y_ceil = np.ceil(x,dtype=int), np.ceil(y,dtype=int)
+
+            # Calculate the fractional part of the coordinates
+            x_frac, y_frac = x - x_floor, y - y_floor
+
+            # Calculate the interpolated value
+            val = (input_img[y_floor, x_floor] * (1 - x_frac) * (1 - y_frac) +
+                   input_img[y_floor, x_ceil] * x_frac * (1 - y_frac) +
+                   input_img[y_ceil, x_floor] * (1 - x_frac) * y_frac +
+                   input_img[y_ceil, x_ceil] * x_frac * y_frac)
+            output[y,x] = val
+
+    return output
+
+
 def make_polar_coordinates(x, y, center=[0,0]):
     '''
     Args:
@@ -46,9 +91,9 @@ def collapse_data(data, pixel_weights=None, axis=1, collapse_method='mean'):
         warnings.simplefilter("ignore", category=RuntimeWarning)
 
         if collapse_method.lower() == 'median':
-
-            return np.nanmedian(data, axis=axis)
-
+            import bottleneck
+            return bottleneck.nanmedian(data, axis=axis)
+            # return np.nanmedian(data, axis=axis)
         elif collapse_method.lower() == 'mean':
 
             return np.nanmean(data, axis=axis)
@@ -88,10 +133,10 @@ def collapse_data(data, pixel_weights=None, axis=1, collapse_method='mean'):
 def klip_math(sci, ref_psfs, numbasis, covar_psfs=None, return_basis=False, return_basis_and_eig=False):
     """
     Helper function for KLIP that does the linear algebra
-    
+
     Args:
         sci: array of length p containing the science data
-        ref_psfs: N x p array of the N reference PSFs that 
+        ref_psfs: N x p array of the N reference PSFs that
                   characterizes the PSF of the p pixels
         numbasis: number of KLIP basis vectors to use (can be an int or an array of ints of length b)
         covar_psfs: covariance matrix of reference psfs passed in so you don't have to calculate it here
@@ -274,8 +319,8 @@ def estimate_movement(radius, parang0=None, parangs=None, wavelength0=None, wave
 def calc_scaling(sats, refwv=18):
     """
     Helper function that calculates the wavelength scaling factor from the satellite spot locations.
-    Uses the movement of spots diagonally across from each other, to calculate the scaling in a 
-    (hopefully? tbd.) centering-independent way. 
+    Uses the movement of spots diagonally across from each other, to calculate the scaling in a
+    (hopefully? tbd.) centering-independent way.
     This method is definitely temporary and will be replaced by better scaling strategies as we come
     up with them.
     Scaling is calculated as the average of (1/2 * sqrt((x_1-x_2)**2+(y_1-y_2))), over the two pairs
@@ -288,8 +333,8 @@ def calc_scaling(sats, refwv=18):
         scaling_factors: Nlambda array of scaling factors
     """
     pairs = [(0,3), (1,2)] # diagonally-located spots (spot_num - 1 for indexing)
-    separations = np.mean([0.5*np.sqrt(np.diff(sats[p,:,0], axis=0)[0]**2 + np.diff(sats[p,:,1], axis=0)[0]**2) 
-                           for p in pairs], 
+    separations = np.mean([0.5*np.sqrt(np.diff(sats[p,:,0], axis=0)[0]**2 + np.diff(sats[p,:,1], axis=0)[0]**2)
+                           for p in pairs],
                           axis=0) # average over each pair, the first axis
 
     scaling_factors = separations/separations[refwv]
@@ -299,9 +344,9 @@ def calc_scaling(sats, refwv=18):
 def nan_map_coordinates_2d(img, yp, xp, mc_kwargs=None):
     """
     scipy.ndimage.map_coordinates() that handles nans for 2-D transformations. Only works in 2-D!
-    
+
     Do NaN detection by defining any pixel in the new coordiante system (xp, yp) as a nan
-    If any one of the neighboring pixels in the original image is a nan (e.g. (xp, yp) = 
+    If any one of the neighboring pixels in the original image is a nan (e.g. (xp, yp) =
     (120.1, 200.1) is nan if either (120, 200), (121, 200), (120, 201), (121, 201) is a nan)
 
     Args:
@@ -311,7 +356,7 @@ def nan_map_coordinates_2d(img, yp, xp, mc_kwargs=None):
         mc_kwargs (dict): other parameters to pass into the map_coordinates function.
 
     Returns:
-        transformed_img (np.array): 2-D transformed image. Each pixel is evaluated at the (yp, xp) specified by xp and yp. 
+        transformed_img (np.array): 2-D transformed image. Each pixel is evaluated at the (yp, xp) specified by xp and yp.
     """
     # check if optional parameters are passed in
     if mc_kwargs is None:
@@ -325,7 +370,7 @@ def nan_map_coordinates_2d(img, yp, xp, mc_kwargs=None):
     xp_ceil = np.clip(np.ceil(xp).astype(int), 0, img.shape[1]-1)
     yp_floor = np.clip(np.floor(yp).astype(int), 0, img.shape[0]-1)
     yp_ceil = np.clip(np.ceil(yp).astype(int), 0, img.shape[0]-1)
-    rotnans = np.where(np.isnan(img[yp_floor.ravel(), xp_floor.ravel()]) | 
+    rotnans = np.where(np.isnan(img[yp_floor.ravel(), xp_floor.ravel()]) |
                        np.isnan(img[yp_floor.ravel(), xp_ceil.ravel()]) |
                        np.isnan(img[yp_ceil.ravel(), xp_floor.ravel()]) |
                        np.isnan(img[yp_ceil.ravel(), xp_ceil.ravel()]))
@@ -339,9 +384,9 @@ def nan_map_coordinates_2d(img, yp, xp, mc_kwargs=None):
 
     # mask nans
     img_shape = transformed_img.shape
-    transformed_img = np.reshape(transformed_img, [img_shape[0] * img_shape[1]], copy=False)
+    transformed_img = transformed_img.reshape(img_shape[0] * img_shape[1])
     transformed_img[rotnans] = np.nan
-    transformed_img = np.reshape(transformed_img, img_shape, copy=False)
+    transformed_img = transformed_img.reshape(img_shape)
 
     return transformed_img
 
@@ -370,7 +415,7 @@ def align_and_scale(img, new_center, old_center=None, scale_factor=1, dtype=floa
     mod_flag = 0 #check how many modifications we are making
 
     #if old_center is specified, realign the images
-    if ((old_center is not None) and not (np.array_equal(new_center, old_center))):
+    if ((old_center is not None) & ~(np.array_equal(new_center, old_center))):
         dx = new_center[0] - old_center[0]
         dy = new_center[1] - old_center[1]
         x -= dx
@@ -402,6 +447,30 @@ def align_and_scale(img, new_center, old_center=None, scale_factor=1, dtype=floa
 
     return resampled_img
 
+def rotate_image(img, angle, center=None, flipx=False):
+    # Ensure array is in a suitable format (float32 or uint8 typically works well with OpenCV)
+    # if img.dtype != np.uint8:
+    #     img = img.astype(np.uint8)
+
+    # Dimensions of the original array
+    height, width = img.shape[:2]
+
+    if center is None:
+        center = height // 2, width // 2
+
+
+    # Calculate the rotation matrix
+    rotation_matrix = cv2.getRotationMatrix2D(center, -angle, 1.0)
+
+    # Perform the rotation using linear interpolation
+    rotated_array = cv2.warpAffine(img, rotation_matrix, (width, height), flags=cv2.INTER_CUBIC)
+
+    # Flip the x-axis if required
+    if flipx:
+        rotated_array = np.flip(rotated_array, axis=1)
+
+    return rotated_array
+
 
 def rotate(img, angle, center, new_center=None, flipx=False, astr_hdr=None):
     """
@@ -428,7 +497,7 @@ def rotate(img, angle, center, new_center=None, flipx=False, astr_hdr=None):
 
     #create the coordinate system of the image to manipulate for the transform
     dims = img.shape
-    x, y = np.meshgrid(np.arange(dims[1], dtype=float), np.arange(dims[0], dtype=float))
+    x, y = np.meshgrid(np.arange(dims[1], dtype=np.float32), np.arange(dims[0], dtype=np.float32))
 
     #if necessary, move coordinates to new center
     if new_center is not None:
@@ -445,7 +514,10 @@ def rotate(img, angle, center, new_center=None, flipx=False, astr_hdr=None):
     xp = (x-center[0])*np.cos(angle_rad) + (y-center[1])*np.sin(angle_rad) + center[0]
     yp = -(x-center[0])*np.sin(angle_rad) + (y-center[1])*np.cos(angle_rad) + center[1]
 
-    resampled_img = nan_map_coordinates_2d(img, yp, xp)
+    params_mc = {'order':1}
+
+    resampled_img = nan_map_coordinates_2d(img, yp, xp, params_mc)
+    # resampled_img = bilinear_interpolate(img, yp, xp)
 
     #edit the astrometry header if given to compensate for orientation
     if astr_hdr is not None:
@@ -488,7 +560,7 @@ def meas_contrast(dat, iwa, owa, resolution, center=None, low_pass_filter=True):
         iwa: inner working angle
         owa: outer working angle
         resolution: size of noise resolution element in pixels (for speckle noise ~ FWHM or lambda/D)
-                    but it can be 1 pixel if limited by pixel-to-pixel noise. 
+                    but it can be 1 pixel if limited by pixel-to-pixel noise.
         center: location of star (x,y). If None, defaults the image size // 2.
         low_pass_filter: if True, run a low pass filter.
                          Can also be a float which specifices the width of the Gaussian filter (sigma).
@@ -539,17 +611,11 @@ def meas_contrast(dat, iwa, owa, resolution, center=None, low_pass_filter=True):
         noise_mean = np.nanmean(filtered[annulus])
         noise_std = np.nanstd(filtered[annulus], ddof=1)
         # account for small sample statistics
-        # num_samples = int(np.floor(2*np.pi*sep/resolution)) # old method
-        # divide the number of non-nan pixels by the approximate size of one resolution element. 
-        num_good_pix = np.size(np.where(~np.isnan(filtered[annulus])))
-        num_samples = int(np.floor(num_good_pix/(np.pi * (resolution/2)**2)))
+        num_samples = int(np.floor(2*np.pi*sep/resolution))
 
         # find 5 sigma flux using student-t statistics
         # Correction based on Mawet et al. 2014
-        if (num_samples != 0):
-            fpf_flux = t.ppf(0.99999971334, num_samples-1, scale=noise_std) * np.sqrt(1 + 1./num_samples) + noise_mean
-        else:
-            fpf_flux = np.nan
+        fpf_flux = t.ppf(0.99999971334, num_samples-1, scale=noise_std) * np.sqrt(1 + 1./num_samples) + noise_mean
         contrast.append(fpf_flux)
 
     return seps, np.array(contrast)
@@ -616,6 +682,48 @@ def high_pass_filter(img, filtersize=10):
         img[nan_index] = fixed_dat
 
     transform = fft.fft2(img)
+
+    # coordinate system in FFT image
+    u,v = np.meshgrid(fft.fftfreq(transform.shape[1]), fft.fftfreq(transform.shape[0]))
+    # scale u,v so it has units of pixels in FFT space
+    rho = np.sqrt((u*transform.shape[1])**2 + (v*transform.shape[0])**2)
+    # scale rho up so that it has units of pixels in FFT space
+    # rho *= transform.shape[0]
+    # create the filter
+    filt = 1. - np.exp(-(rho**2/filtersize**2))
+
+    filtered = np.real(fft.ifft2(transform*filt))
+
+    # restore NaNs
+    filtered[nan_index] = np.nan
+    img[nan_index] = np.nan
+
+    return filtered
+
+def convolve_then_filter_model(img, ft_psf, filtersize=10):
+    """
+    A FFT implmentation of high pass filter.
+
+    Args:
+        img: a 2D image
+        filtersize: size in Fourier space of the size of the space. In image space, size=img_size/filtersize
+
+    Returns:
+        filtered: the filtered image
+    """
+    # mask NaNs if there are any
+    nan_index = np.where(np.isnan(img))
+    if np.size(nan_index) > 0:
+        good_index = np.where(~np.isnan(img))
+        y, x = np.indices(img.shape)
+        good_coords = np.array([x[good_index], y[good_index]]).T # shape of Npix, ndimage
+        nan_fixer = sinterp.NearestNDInterpolator(good_coords, img[good_index])
+        fixed_dat = nan_fixer(x[nan_index], y[nan_index])
+        img[nan_index] = fixed_dat
+
+    transform = fft.fft2(img)
+
+    transform *= ft_psf
 
     # coordinate system in FFT image
     u,v = np.meshgrid(fft.fftfreq(transform.shape[1]), fft.fftfreq(transform.shape[0]))

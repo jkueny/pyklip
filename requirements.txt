@@ -7,3 +7,6 @@ corner
 astroquery
 tqdm
 h5py
+numba
+opencv-python-headless
+bottleneck

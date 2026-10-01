@@ -14,7 +14,10 @@ dependencies = [
     "emcee>3",
     "corner",
     "astroquery",
-    "tqdm"
+    "tqdm",
+    "numba",
+    "opencv-python-headless",
+    "bottleneck"
 ]
 readme = "README.md"
 license = "BSD-3-Clause"

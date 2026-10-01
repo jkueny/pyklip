@@ -34,3 +34,4 @@ build/
 dist/
 .DS_Store
 pyklip/.DS_Store
+.venv/

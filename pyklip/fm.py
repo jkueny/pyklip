@@ -1,4 +1,3 @@
-
 #KLIP Forward Modelling
 import os
 from sys import stdout
@@ -7,6 +6,7 @@ from time import time
 import itertools
 import multiprocessing as mp
 import ctypes
+import numba
 
 import numpy as np
 import scipy.linalg as la
@@ -26,7 +26,9 @@ except ImportError:
     mkl_exists = False
 
 # Turns parallelism off for debugging purposes
-debug = False
+debug = True
+
+
 
 def find_id_nearest(array, value):
     """
@@ -39,6 +41,10 @@ def find_id_nearest(array, value):
     """
     index = (np.abs(array-value)).argmin()
     return index
+
+
+
+
 
 def klip_math(sci, refs, numbasis, covar_psfs=None, model_sci=None, models_ref=None, spec_included=False, spec_from_model=False):
     """
@@ -90,7 +96,7 @@ def klip_math(sci, refs, numbasis, covar_psfs=None, model_sci=None, models_ref=N
     tot_basis = covar_psfs.shape[0]
 
     if numbasis[0] is None:
-        evals, evecs = la.eigh(covar_psfs, subset_by_index = (tot_basis-np.min([100,tot_basis-1]), tot_basis-1))
+        evals, evecs = la.eigh(covar_psfs, subset_by_index=(tot_basis-np.min([100,tot_basis-1]), tot_basis-1))
         evals = np.copy(evals[::-1])
         evecs = np.copy(evecs[:,::-1])
         # import matplotlib.pyplot as plt
@@ -105,7 +111,7 @@ def klip_math(sci, refs, numbasis, covar_psfs=None, model_sci=None, models_ref=N
         max_basis = np.max(numbasis) + 1
 
         # calculate eigenvectors/values of covariance matrix
-        evals, evecs = la.eigh(covar_psfs, subset_by_index = (int(tot_basis-max_basis), int(tot_basis-1)))
+        evals, evecs = la.eigh(covar_psfs, subset_by_index=(int(tot_basis-max_basis), int(tot_basis-1)))
         evals = np.copy(evals[::-1])
         evecs = np.copy(evecs[:,::-1])
 
@@ -168,8 +174,44 @@ def klip_math(sci, refs, numbasis, covar_psfs=None, model_sci=None, models_ref=N
     else:
         return sub_img_rows_selected.transpose(), KL_basis, evals, evecs
 
-# @profile
-def perturb_specIncluded(evals, evecs, original_KL, refs, models_ref, return_perturb_covar=False):
+@numba.njit
+def tile_rows(arr, reps0):
+    """
+    Repeat the 1D array `arr` reps0 times along a new first axis,
+    producing a 2D array of shape (reps0, arr.shape[0]).
+    Equivalent to np.tile(arr, (reps0, 1)), but works under Numba.
+    """
+    m = reps0
+    n = arr.shape[0]
+    out = np.empty((m, n), arr.dtype)
+    for i in range(m):
+        # copy the entire row in
+        for j in range(n):
+            out[i, j] = arr[j]
+    return out
+
+@numba.njit
+def subtract_row_means(arr):
+    """
+    For a 2D array arr of shape (N_image, pixels), compute:
+      out[i, j] = arr[i, j] - (1/pixels) * sum_k arr[i, k]
+    """
+    n_rows, n_cols = arr.shape
+    out = np.empty((n_rows, n_cols), arr.dtype)
+    for i in range(n_rows):
+        # 1) compute the sum of row i
+        total = 0.0
+        for j in range(n_cols):
+            total += arr[i, j]
+        # 2) compute the mean
+        mean = total / n_cols
+        # 3) subtract it
+        for j in range(n_cols):
+            out[i, j] = arr[i, j] - mean
+    return out
+
+@numba.njit
+def perturb_jit(evals, evecs, original_KL, refs, models_ref):
     """
     Perturb the KL modes using a model of the PSF but with the spectrum included in the model. Quicker than the others
 
@@ -189,24 +231,35 @@ def perturb_specIncluded(evals, evecs, original_KL, refs, models_ref, return_per
 
     max_basis = original_KL.shape[0]
     N_ref = refs.shape[0]
-    N_pix = original_KL.shape[1]
+    # N_pix = original_KL.shape[1]
 
-    refs_mean_sub = refs - np.nanmean(refs, axis=1)[:, None]
-    refs_mean_sub[np.where(np.isnan(refs_mean_sub))] = 0
+    # refs_mean_sub = refs - np.mean(refs, axis=1)[:, None] #tested, no NaNs and nanmean is slow
+    # refs_mean_sub = refs - np.nanmean(refs, axis=1)[:, None]
+    refs_mean_sub = subtract_row_means(refs)
+    # refs_mean_sub[np.where(np.isnan(refs_mean_sub))] = 0
+    # refs_mean_sub[refs_mean_sub != refs_mean_sub] = 0
 
-    models_mean_sub = models_ref # - np.nanmean(models_ref, axis=1)[:,None] should this be the case?
-    models_mean_sub[np.where(np.isnan(models_mean_sub))] = 0
+    # models_mean_sub = models_ref # - np.nanmean(models_ref, axis=1)[:,None] should this be the case?
+    models_mean_sub = subtract_row_means(models_ref)
+    # models_mean_sub[models_mean_sub != models_mean_sub] = 0
 
     #print(evals.shape,evecs.shape,original_KL.shape,refs.shape,models_ref.shape)
-
-    evals_tiled = np.tile(evals,(max_basis,1))
-    np.fill_diagonal(evals_tiled,np.nan)
+    # evals_tiled = np.tile(evals,(max_basis,1))
+    evals_tiled = tile_rows(evals,reps0=max_basis)
+    # evals_tiled = evals_tiled[:,np.newaxis]
+    # np.fill_diagonal(evals_tiled,np.nan)
+    # np.fill_diagonal(evals_tiled,1)
+    for k in range(max_basis):
+        evals_tiled[k, k] = 1.0
     evals_sqrt = np.sqrt(evals)
     evalse_inv_sqrt = 1./evals_sqrt
     evals_ratio = (evalse_inv_sqrt[:,None]).dot(evals_sqrt[None,:])
     beta_tmp = 1./(evals_tiled.transpose()- evals_tiled)
     #print(evals)
-    beta_tmp[np.diag_indices(np.size(evals))] = -0.5/evals
+    # beta_tmp[np.diag_indices(np.size(evals))] = -0.5/evals
+    n = evals.shape[0]            # number of modes
+    for i in range(n):
+        beta_tmp[i, i] = -0.5 / evals[i]
     beta = evals_ratio*beta_tmp
 
     C_partial = models_mean_sub.dot(refs_mean_sub.transpose())
@@ -216,10 +269,68 @@ def perturb_specIncluded(evals, evecs, original_KL, refs, models_ref, return_per
 
     delta_KL = (beta*alpha).dot(original_KL)+(evalse_inv_sqrt[:,None]*evecs.transpose()).dot(models_mean_sub)
 
+    # if return_perturb_covar:
+    #     return delta_KL, C
+    # else:
+    return delta_KL
+
+def perturb_specIncluded(evals, evecs, original_KL, refs, models_ref,
+                         return_perturb_covar=False):
+    """
+    Perturb the KL modes using a model of the PSF but with the spectrum included in the model. Quicker than the others
+
+    Args:
+        evals: array of eigenvalues of the reference PSF covariance matrix (array of size numbasis)
+        evecs: corresponding eigenvectors (array of size [p, numbasis])
+        orignal_KL: unpertrubed KL modes (array of size [numbasis, p])
+        refs: N x p array of the N reference images that
+                  characterizes the extended source with p pixels
+        models_ref: N x p array of the N models corresponding to reference images.
+                    Each model should contain spectral informatoin
+        model_sci: array of size p corresponding to the PSF of the science frame
+
+    Returns:
+        delta_KL_nospec: perturbed KL modes. Shape is (numKL, wv, pix)
+    """
+
+    max_basis = original_KL.shape[0]
+    N_ref = refs.shape[0]
+    # N_pix = original_KL.shape[1]
+
+    refs_mean_sub = refs - np.mean(refs, axis=1)[:, None] #tested, no NaNs and nanmean is slow
+
+
+    models_mean_sub = models_ref # - np.nanmean(models_ref, axis=1)[:,None] should this be the case?
+    # models_mean_sub[models_mean_sub != models_mean_sub] = 0
+
+    evals_tiled = np.tile(evals,(max_basis,1))
+
+    np.fill_diagonal(evals_tiled,1)
+    # for k in range(max_basis):
+    #     evals_tiled[k, k] = 1.0
+    evals_sqrt = np.sqrt(evals)
+    evalse_inv_sqrt = 1./evals_sqrt
+    evals_ratio = (evalse_inv_sqrt[:,None]).dot(evals_sqrt[None,:])
+    beta_tmp = 1./(evals_tiled.transpose()- evals_tiled)
+
+    n = evals.shape[0]            # number of modes
+    for i in range(n):
+        beta_tmp[i, i] = -0.5 / evals[i]
+    beta = evals_ratio*beta_tmp
+
+    C_partial = models_mean_sub.dot(refs_mean_sub.transpose())
+    C = C_partial+C_partial.transpose()
+    alpha = (evecs.transpose()).dot(C).dot(evecs)
+
+    delta_KL = (beta*alpha).dot(original_KL)+(evalse_inv_sqrt[:,None]*evecs.transpose()).dot(models_mean_sub)
+
     if return_perturb_covar:
         return delta_KL, C
-    else:
-        return delta_KL
+    return delta_KL
+
+
+
+
 
 
 def perturb_nospec_modelsBased(evals, evecs, original_KL, refs, models_ref_list):
@@ -276,6 +387,10 @@ def perturb_nospec_modelsBased(evals, evecs, original_KL, refs, models_ref_list)
 
 
     return delta_KL_nospec
+
+
+
+
 
 def pertrurb_nospec(evals, evecs, original_KL, refs, models_ref):
     """
@@ -351,6 +466,10 @@ def pertrurb_nospec(evals, evecs, original_KL, refs, models_ref):
     return delta_KL_nospec
 
 
+
+
+
+
 def calculate_fm(delta_KL_nospec, original_KL, numbasis, sci, model_sci, inputflux = None):
     r"""
     Calculate what the PSF looks up post-KLIP using knowledge of the input PSF, assumed spectrum of the science target,
@@ -386,7 +505,7 @@ def calculate_fm(delta_KL_nospec, original_KL, numbasis, sci, model_sci, inputfl
         klipped_selfsub: Sum(<N|DKL>KL) + Sum(<N|KL>DKL) with klipped_selfsub.shape = (size(numbasis),N_lambda or N_ref,N_pix)
     """
     if np.size(numbasis) == 1:
-        return calculate_fm_singleNumbasis(delta_KL_nospec, original_KL, numbasis, sci, model_sci, inputflux = inputflux)
+        return calculate_fm_singleNumbasis(delta_KL_nospec, original_KL, numbasis, sci, model_sci)
 
     max_basis = original_KL.shape[0]
     if numbasis[0] is None:
@@ -395,9 +514,12 @@ def calculate_fm(delta_KL_nospec, original_KL, numbasis, sci, model_sci, inputfl
         numbasis_index = np.clip(numbasis - 1, 0, max_basis-1)
 
     # remove means and nans from science image
-    sci_mean_sub = np.copy(sci - np.nanmean(sci))
-    sci_nanpix = np.where(np.isnan(sci_mean_sub))
-    sci_mean_sub[sci_nanpix] = 0
+    # sci_mean_sub = np.copy(sci - np.nanmean(sci))
+    sci_mean = np.mean(sci)
+    sci_mean_sub = np.copy(sci - sci_mean)
+    # sci_nanpix = np.where(np.isnan(sci_mean_sub))
+    # sci_mean_sub[sci_nanpix] = 0
+    sci_mean_sub[sci_mean_sub != sci_mean_sub] = 0
     sci_mean_sub_rows = np.tile(sci_mean_sub, (max_basis,1))
     #sci_rows_selected = np.tile(sci_mean_sub, (np.size(numbasis),1))
 
@@ -405,8 +527,9 @@ def calculate_fm(delta_KL_nospec, original_KL, numbasis, sci, model_sci, inputfl
     # science PSF models, ready for FM
     # /!\ JB: If subtracting the mean. It should be done here. not in klip_math since we don't use model_sci there.
     model_sci_mean_sub = model_sci # should be subtracting off the mean?
-    model_nanpix = np.where(np.isnan(model_sci_mean_sub))
-    model_sci_mean_sub[model_nanpix] = 0
+    # model_nanpix = np.where(np.isnan(model_sci_mean_sub))
+    # model_sci_mean_sub[model_nanpix] = 0
+    model_sci_mean_sub[model_sci_mean_sub != model_sci_mean_sub] = 0
     model_sci_mean_sub_rows = np.tile(model_sci_mean_sub, (max_basis,1))
     # model_rows_selected = np.tile(sci_mean_sub, (np.size(numbasis),1)) # don't need this because of python behavior where I don't need to duplicate rows
 
@@ -481,7 +604,11 @@ def calculate_fm(delta_KL_nospec, original_KL, numbasis, sci, model_sci, inputfl
         return klipped_oversub, klipped_selfsub
 
 
-def calculate_fm_singleNumbasis(delta_KL_nospec, original_KL, numbasis, sci, model_sci, inputflux = None):
+
+
+
+# @numba.njit
+def calculate_fm_singleNumbasis(delta_KL_nospec, original_KL, numbasis, sci, model_sci):
     r"""
     Same function as calculate_fm() but faster when numbasis has only one element. It doesn't do the mutliplication with
     the triangular matrix.
@@ -520,34 +647,30 @@ def calculate_fm_singleNumbasis(delta_KL_nospec, original_KL, numbasis, sci, mod
 
     """
     max_basis = original_KL.shape[0]
-    if numbasis[0] is None:
-        numbasis_index = [max_basis-1]
-    else:
-        numbasis_index = np.clip(numbasis - 1, 0, max_basis-1)
 
-    N_pix = np.size(sci)
+
+    N_pix = sci.size
 
     # remove means and nans from science image
-    sci_mean_sub = sci - np.nanmean(sci)
-    sci_nanpix = np.where(np.isnan(sci_mean_sub))
-    sci_mean_sub[sci_nanpix] = 0
+    sci_mean = np.mean(sci)
+    sci_mean_sub = sci - sci_mean
+    # sci_nanpix = np.where(np.isnan(sci_mean_sub))
+    # sci_mean_sub[sci_nanpix] = 0
+    # sci_mean_sub[sci_mean_sub != sci_mean_sub] = 0
     sci_mean_sub_rows = np.reshape(sci_mean_sub,(1,N_pix))
 
 
     # science PSF models, ready for FM
     # /!\ JB: If subtracting the mean. It should be done here. not in klip_math since we don't use model_sci there.
     model_sci_mean_sub = model_sci # should be subtracting off the mean?
-    model_nanpix = np.where(np.isnan(model_sci_mean_sub))
-    model_sci_mean_sub[model_nanpix] = 0
+    # model_nanpix = np.where(np.isnan(model_sci_mean_sub))
+    # model_sci_mean_sub[model_nanpix] = 0
+    # model_sci_mean_sub[model_sci_mean_sub != model_sci_mean_sub] = 0
     model_sci_mean_sub_rows = np.reshape(model_sci_mean_sub,(1,N_pix))
 
 
-    # calculate perturbed KL modes based on spectrum
-    if inputflux is not None:
-        # delta_KL_nospec.shape = (max_basis,N_lambda,N_pix) or (max_basis,N_ref,N_pix)
-        delta_KL = np.dot(inputflux, delta_KL_nospec) # this will take the last dimension of input_spectrum (wv) and sum over the second to last dimension of delta_KL_nospec (wv)
-    else:
-        delta_KL = delta_KL_nospec
+
+    delta_KL = delta_KL_nospec
 
 
     # Forward model the PSF
@@ -565,59 +688,36 @@ def calculate_fm_singleNumbasis(delta_KL_nospec, original_KL, numbasis, sci, mod
     # original_KL.shape = (max_basis,N_pix)
     # delta_KL.shape = (max_basis,N_pix)
     oversubtraction_inner_products = np.dot(model_sci_mean_sub_rows, original_KL.T)
-    if np.size(delta_KL.shape) == 2:
-        selfsubtraction_1_inner_products = np.dot(sci_mean_sub_rows, delta_KL.T)
-        # selfsubtraction_1_inner_products.shape = (max_basis,N_pix,max_basis)
-    else:
-        Nlambda = delta_KL.shape[1]
-        #Before delta_KL.shape = (max_basis,N_lambda or N_ref,N_pix)
-        delta_KL = np.rollaxis(delta_KL,1,0)
-        #Now delta_KL.shape = (N_lambda or N_ref,max_basis,N_pix)
-        # np.rollaxis(delta_KL,2,1).shape = (N_lambda or N_ref,N_pix,max_basis)
-        # np.dot() takes the last dimension of first array and sum over the second to last dimension of second array
-        selfsubtraction_1_inner_products = np.dot(sci_mean_sub_rows, np.rollaxis(delta_KL,2,1))
-        # selfsubtraction_1_inner_products.shape = (N_lambda or N_ref,max_basis,max_basis)
+    selfsubtraction_1_inner_products = np.dot(sci_mean_sub_rows, delta_KL.T)
+    # selfsubtraction_1_inner_products.shape = (max_basis,N_pix,max_basis)
+
     selfsubtraction_2_inner_products = np.dot(sci_mean_sub_rows, original_KL.T)
 
     # oversubtraction_inner_products = (1,max_basis)
     oversubtraction_inner_products[max_basis::] = 0
     klipped_oversub = np.dot(oversubtraction_inner_products, original_KL)
-    if np.size(delta_KL.shape) == 2:
-        # selfsubtraction_1_inner_products = (1,max_basis)
-        # selfsubtraction_2_inner_products = (1,max_basis)
-        selfsubtraction_1_inner_products[0,max_basis::] = 0
-        selfsubtraction_2_inner_products[0,max_basis::] = 0
-        klipped_selfsub = np.dot(selfsubtraction_1_inner_products, original_KL) + \
-                          np.dot(selfsubtraction_2_inner_products, delta_KL)
+    # selfsubtraction_1_inner_products = (1,max_basis)
+    # selfsubtraction_2_inner_products = (1,max_basis)
+    selfsubtraction_1_inner_products[0,max_basis::] = 0
+    selfsubtraction_2_inner_products[0,max_basis::] = 0
+    klipped_selfsub = np.dot(selfsubtraction_1_inner_products, original_KL) + \
+                        np.dot(selfsubtraction_2_inner_products, delta_KL)
 
-        # secondorder_inner_products = np.dot(model_sci_mean_sub_rows, delta_KL.T)
-        # klipped_secondOrder = np.dot(selfsubtraction_1_inner_products, delta_KL) + \
-        #                      np.dot(oversubtraction_inner_products, delta_KL) + \
-        #                      np.dot(secondorder_inner_products, original_KL) + \
-        #                      np.dot(secondorder_inner_products, delta_KL)
-        # # print(oversubtraction_inner_products.shape,selfsubtraction_1_inner_products.shape,selfsubtraction_2_inner_products.shape,secondorder_inner_products.shape)
-        # # print(sci_mean_sub_rows.shape,model_sci_mean_sub_rows.shape,delta_KL.shape,original_KL.shape)
-        # return model_sci[None,:] - klipped_oversub - klipped_selfsub - klipped_secondOrder, klipped_oversub, klipped_selfsub
-        return model_sci[None,:] - klipped_oversub - klipped_selfsub, klipped_oversub, klipped_selfsub
-        #return model_sci[None,:], klipped_oversub, klipped_selfsub
-    else:
-        for k in range(Nlambda):
-            selfsubtraction_1_inner_products[:,k,max_basis::] = 0
-        selfsubtraction_1_inner_products = np.rollaxis(selfsubtraction_1_inner_products,0,1)
-        selfsubtraction_2_inner_products[:,max_basis::] = 0
-        # selfsubtraction_1_inner_products = (N_lambda or N_ref,max_basis,max_basis)
-        # selfsubtraction_2_inner_products = (N_ref=max_basis,max_basis)
-        # original_KL.shape = (max_basis,N_pix)
-        # delta_KL.shape = (N_lambda or N_ref,max_basis,N_pix)
-        klipped_selfsub1 = np.dot(selfsubtraction_1_inner_products, original_KL)
-        klipped_selfsub2 = np.dot(selfsubtraction_2_inner_products, delta_KL)
-        klipped_selfsub = klipped_selfsub1 + klipped_selfsub2
+    # secondorder_inner_products = np.dot(model_sci_mean_sub_rows, delta_KL.T)
+    # klipped_secondOrder = np.dot(selfsubtraction_1_inner_products, delta_KL) + \
+    #                      np.dot(oversubtraction_inner_products, delta_KL) + \
+    #                      np.dot(secondorder_inner_products, original_KL) + \
+    #                      np.dot(secondorder_inner_products, delta_KL)
+    # # print(oversubtraction_inner_products.shape,selfsubtraction_1_inner_products.shape,selfsubtraction_2_inner_products.shape,secondorder_inner_products.shape)
+    # # print(sci_mean_sub_rows.shape,model_sci_mean_sub_rows.shape,delta_KL.shape,original_KL.shape)
+    # return model_sci[None,:] - klipped_oversub - klipped_selfsub - klipped_secondOrder, klipped_oversub, klipped_selfsub
+    return model_sci[None,:] - klipped_oversub - klipped_selfsub, klipped_oversub, klipped_selfsub
+    #return model_sci[None,:], klipped_oversub, klipped_selfsub
 
-        # klipped_oversub.shape = (size(numbasis),Npix)
-        # klipped_selfsub.shape = (size(numbasis),N_lambda or N_ref,N_pix)
-        # klipped_oversub = Sum(<S|KL>KL)
-        # klipped_selfsub = Sum(<N|DKL>KL) + Sum(<N|KL>DKL)
-        return klipped_oversub, klipped_selfsub
+
+
+
+
 
 
 
@@ -646,7 +746,7 @@ def calculate_validity(covar_perturb, models_ref, numbasis, evals_orig, covar_or
 
     ## calculate eigenvectors/values including 1st order term in covariance matrix expansion
     #evals_linear, evecs_linear = la.eigh(covar_orig + covar_perturb, eigvals = (tot_basis-max_basis, tot_basis-1))
-    #evals_linear = np.copy(evals_linear[::-1]) 
+    #evals_linear = np.copy(evals_linear[::-1])
     ## calculate eigenvectors/values including first and 2nd order term in covariance matrix expansion
     #evals_full, evecs_full = la.eigh(covar_orig + covar_perturb + covars_model, eigvals = (tot_basis-max_basis, tot_basis-1))
     #evals_full = np.copy(evals_full[::-1])
@@ -690,6 +790,8 @@ def calculate_validity(covar_perturb, models_ref, numbasis, evals_orig, covar_or
 
 
 
+
+
 #####################################################################
 ################# Begin Parallelized Framework ######################
 #####################################################################
@@ -697,7 +799,7 @@ def calculate_validity(covar_perturb, models_ref, numbasis, evals_orig, covar_or
 def _tpool_init(original_imgs, original_imgs_shape, aligned_imgs, aligned_imgs_shape, output_imgs, output_imgs_shape,
                 output_imgs_numstacked,
                 pa_imgs, wvs_imgs, centers_imgs, interm_imgs, interm_imgs_shape, fmout_imgs, fmout_imgs_shape,
-                perturbmag_imgs, perturbmag_imgs_shape, psf_library, psf_library_shape, centers_mask):
+                perturbmag_imgs, perturbmag_imgs_shape, psf_library, psf_library_shape):
     """
     Initializer function for the thread pool that initializes various shared variables. Main things to note that all
     except the shapes are shared arrays (mp.Array) - output_imgs does not need to be mp.Array and can be anything
@@ -721,11 +823,10 @@ def _tpool_init(original_imgs, original_imgs_shape, aligned_imgs, aligned_imgs_s
         fmout_imgs_shape: shape of fmout
         perturbmag_imgs: array for output of size of linear perturbation to assess validity
         perturbmag_imgs_shape: shape of perturbmag_imgs
-        centers_mask: mask centers. same dimesion as center_imgs that specify star_centers
     """
     global original, original_shape, aligned, aligned_shape, outputs, outputs_shape, outputs_numstacked, img_pa, \
         img_wv, img_center, interm, interm_shape, fmout, fmout_shape, perturbmag, perturbmag_shape, \
-        psf_lib, psf_lib_shape, mask_centers
+        psf_lib, psf_lib_shape
     # original images from files to read and align&scale. Shape of (N,y,x)
     original = original_imgs
     original_shape = original_imgs_shape
@@ -740,7 +841,6 @@ def _tpool_init(original_imgs, original_imgs_shape, aligned_imgs, aligned_imgs_s
     img_pa = pa_imgs
     img_wv = wvs_imgs
     img_center = centers_imgs
-    mask_centers = centers_mask
 
     #intermediate and FM arrays
     interm = interm_imgs
@@ -755,7 +855,7 @@ def _tpool_init(original_imgs, original_imgs_shape, aligned_imgs, aligned_imgs_s
     psf_lib_shape = psf_library_shape
 
 
-def _align_and_scale_subset(thread_index, aligned_center,numthreads = None,dtype=float, wvs_dtype=float):
+def _align_and_scale_subset(thread_index, aligned_center,numthreads = None,dtype=float):
     """
     Aligns and scales a subset of images
 
@@ -764,15 +864,13 @@ def _align_and_scale_subset(thread_index, aligned_center,numthreads = None,dtype
         algined_center: center to align things to
         numthreads: Number of threads to be used. if none mp.cpu_count() is used.
         dtype: data type of the arrays for numpy (Should match the type used for the shared multiprocessing arrays)
-        wvs_dtype: data type for the wavelength array
 
     Returns:
         None
     """
     original_imgs = _arraytonumpy(original, original_shape,dtype=dtype)
-    wvs_imgs = _arraytonumpy(img_wv,dtype=wvs_dtype)
+    wvs_imgs = _arraytonumpy(img_wv,dtype=dtype)
     centers_imgs = _arraytonumpy(img_center, (np.size(wvs_imgs),2),dtype=dtype)
-    centers_mask = _arraytonumpy(mask_centers, (np.size(wvs_imgs),2),dtype=dtype)
     aligned_imgs = _arraytonumpy(aligned, aligned_shape,dtype=dtype)
 
     unique_wvs = np.unique(wvs_imgs)
@@ -836,10 +934,10 @@ def _get_section_indicies(input_shape, img_center, radstart, radend, phistart, p
     # create a coordinate system.
     x, y = np.meshgrid(np.arange(input_shape[1] * 1.0), np.arange(input_shape[0] * 1.0))
     if flatten:
-        x = np.reshape(x, (x.shape[0] * x.shape[1],), copy=False) # Flatten
-        y = np.reshape(y, (y.shape[0] * y.shape[1],), copy=False)
+        x = x.reshape(x.shape[0] * x.shape[1])  # Flatten
+        y = y.reshape(y.shape[0] * y.shape[1])
     if flipx:
-        x = img_center[0] - (x - img_center[0])        
+        x = img_center[0] - (x - img_center[0])
     r = np.sqrt((x - img_center[0])**2 + (y - img_center[1])**2)
     phi = np.arctan2(y - img_center[1], x - img_center[0])
 
@@ -910,18 +1008,18 @@ def _save_rotated_section(input_shape, sector, sector_ind, output_img, output_im
     phiend %= 2 * np.pi
 
     #incorporate padding
-    IWA,OWA = IOWA
-    radstart_padded = np.max([radstart-padding,IWA])
-    if OWA is not None:
-        radend_padded = np.min([radend+padding,OWA])
-    else:
-        radend_padded = radend+padding
-    phistart_padded = (phistart - padding/np.mean([radstart, radend])) % (2 * np.pi)
-    phiend_padded = (phiend + padding/np.mean([radstart, radend])) % (2 * np.pi)
+    # IWA,OWA = IOWA
+    # radstart_padded = np.max([radstart-padding,IWA])
+    # if OWA is not None:
+    #     radend_padded = np.min([radend+padding,OWA])
+    # else:
+    #     radend_padded = radend+padding
+    # phistart_padded = (phistart - padding/np.mean([radstart, radend])) % (2 * np.pi)
+    # phiend_padded = (phiend + padding/np.mean([radstart, radend])) % (2 * np.pi)
 
     # create the coordinate system of the image to manipulate for the transform
     dims = input_shape
-    x, y = np.meshgrid(np.arange(dims[1], dtype=float), np.arange(dims[0], dtype=float))
+    x, y = np.meshgrid(np.arange(dims[1], dtype=np.float32), np.arange(dims[0], dtype=np.float32))
 
     # if necessary, move coordinates to new center
     if new_center is not None:
@@ -952,64 +1050,71 @@ def _save_rotated_section(input_shape, sector, sector_ind, output_img, output_im
     dims = input_shape
     blank_input = np.zeros(dims[1] * dims[0])
     blank_input[sector_ind] = sector
-    blank_input = np.reshape(blank_input, [dims[0], dims[1]], copy=False)
+    blank_input = blank_input.reshape(dims[0], dims[1])
 
     xp_floor = np.clip(np.floor(xp).astype(int), 0, xp.shape[1]-1)[rot_sector_pix]
     xp_ceil = np.clip(np.ceil(xp).astype(int), 0, xp.shape[1]-1)[rot_sector_pix]
     yp_floor = np.clip(np.floor(yp).astype(int), 0, yp.shape[0]-1)[rot_sector_pix]
     yp_ceil = np.clip(np.ceil(yp).astype(int), 0, yp.shape[0]-1)[rot_sector_pix]
-    rotnans = np.where(np.isnan(blank_input[yp_floor.ravel(), xp_floor.ravel()]) | 
+    rotnans = np.where(np.isnan(blank_input[yp_floor.ravel(), xp_floor.ravel()]) |
                        np.isnan(blank_input[yp_floor.ravel(), xp_ceil.ravel()]) |
                        np.isnan(blank_input[yp_ceil.ravel(), xp_floor.ravel()]) |
                        np.isnan(blank_input[yp_ceil.ravel(), xp_ceil.ravel()]))
 
     # resample image based on new coordinates, set nan values as median
-    nanpix = np.where(np.isnan(blank_input))
-    medval = np.median(blank_input[np.where(~np.isnan(blank_input))])
+    nanpix = np.isnan(blank_input)
+    # medval = np.median(blank_input[np.where(~np.isnan(blank_input))])
+    medval = np.median(blank_input[~nanpix])
     input_copy = np.copy(blank_input)
     input_copy[nanpix] = medval
-    rot_sector = ndimage.map_coordinates(input_copy, [yp[rot_sector_pix], xp[rot_sector_pix]], cval=np.nan)
+    rot_sector = ndimage.map_coordinates(input_copy,
+                                         [yp[rot_sector_pix], xp[rot_sector_pix]],
+                                         order=0, cval=np.nan)
+    # rot_sector = klip.bilinear_interpolate(input_copy, yp[rot_sector_pix], xp[rot_sector_pix])
 
     # mask nans
     rot_sector[rotnans] = np.nan
-    sector_validpix = np.where(~np.isnan(rot_sector))
+    # sector_validpix = np.where(~np.isnan(rot_sector))
+    sector_validpix = np.isnan(rot_sector)
 
     # need to define only where the non nan pixels are, so we can store those in the output image
     blank_output = np.zeros([dims[0], dims[1]]) * np.nan
     blank_output[rot_sector_pix] = rot_sector
-    blank_output = np.reshape(blank_output, (dims[0], dims[1]), copy=False)
     rot_sector_validpix_2d = np.where(~np.isnan(blank_output))
+    # rot_sector_validpix_2d = np.isnan(blank_output)
 
     # save output sector. We need to reshape the array into 2d arrays to save it
-    output_img = np.reshape(output_img, [outputs_shape[1], outputs_shape[2]], copy=False)
-    output_img[rot_sector_validpix_2d] = np.nansum([output_img[rot_sector_pix][sector_validpix], rot_sector[sector_validpix]], axis=0)
-    output_img = np.reshape(output_img, [outputs_shape[1] * outputs_shape[2]], copy=False)
+    output_img_2d = output_img.reshape(outputs_shape[1], outputs_shape[2])
+    output_img_2d[rot_sector_validpix_2d] = np.nansum(
+        [output_img_2d[rot_sector_pix][~sector_validpix],
+         rot_sector[~sector_validpix]],
+        axis=0)
 
     # Increment the numstack counter if it is not None
     if output_img_numstacked is not None:
-        output_img_numstacked = np.reshape(output_img_numstacked, [outputs_shape[1], outputs_shape[2]], copy=False)
-        output_img_numstacked[rot_sector_validpix_2d] += 1
-        output_img_numstacked = np.reshape(output_img_numstacked, [outputs_shape[1] * outputs_shape[2]], copy=False)
+        output_img_numstacked_2d = output_img_numstacked.reshape(
+            outputs_shape[1], outputs_shape[2])
+        output_img_numstacked_2d[rot_sector_validpix_2d] += 1
 
 
-def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, OWA=None, mode='ADI+SDI', annuli=5, 
-                      subsections=4, movement=None, flux_overlap=0.1,PSF_FWHM=3.5, numbasis=None,maxnumbasis=None, 
-                      corr_smooth=1, aligned_center=None, numthreads=None, minrot=0, maxrot=360,
+
+
+def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, OWA=None, mode='ADI+SDI', annuli=5, subsections=4,
+                      movement=None, flux_overlap=0.1,PSF_FWHM=3.5, numbasis=None,maxnumbasis=None, corr_smooth=1,
+                      aligned_center=None, numthreads=None, minrot=0, maxrot=360,
                       spectrum=None, psf_library=None, psf_library_good=None, psf_library_corr=None,
                       padding=0, save_klipped=True, flipx=True,
-                      N_pix_sector = None,mute_progression = False, annuli_spacing="constant", 
-                      compute_noise_cube=False):
+                      N_pix_sector = None,mute_progression = False, annuli_spacing="constant", compute_noise_cube=False):
     """
     multithreaded KLIP PSF Subtraction
 
     Args:
         imgs: array of 2D images for ADI. Shape of array (N,y,x)
-        centers: N by 2 array of (x,y) coordinates of image star centers
+        centers: N by 2 array of (x,y) coordinates of image centers
         parangs: N length array detailing parallactic angle of each image
         wvs: N length array of the wavelengths
         IWA: inner working angle (in pixels)
         fm_class: class that implements the the forward modelling functionality
-        mask_centers: N by 2 array of (x,y) coordinates of coronagraph mask centers
         OWA: if defined, the outer working angle for pyklip. Otherwise, it will pick it as the cloest distance to a
             nan in the first frame
         mode: one of ['ADI', 'SDI', 'ADI+SDI'] for ADI, SDI, or ADI+SDI
@@ -1054,7 +1159,7 @@ def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, 
         mute_progression: Mute the printing of the progression percentage. Indeed sometimes the overwriting feature
                         doesn't work and one ends up with thousands of printed lines. Therefore muting it can be a good
                         idea.
-        annuli_spacing: how to distribute the annuli radially. Currently three options. Constant (equally spaced), 
+        annuli_spacing: how to distribute the annuli radially. Currently three options. Constant (equally spaced),
                         log (logarithmical expansion with r), and linear (linearly expansion with r)
         compute_noise_cube:  if True, compute the noise in each pixel assuming azimuthally uniform noise
 
@@ -1066,6 +1171,7 @@ def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, 
         perturbmag: output indicating the magnitude of the linear perturbation to assess validity of KLIP FM
         aligned_center: (x, y) location indicating the star center for all images and FM after PSF subtraction
     """
+
     ################## Interpret input arguments ####################
 
     # defaullt numbasis if none
@@ -1191,26 +1297,21 @@ def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, 
     original_imgs_shape = imgs.shape
     original_imgs_np = _arraytonumpy(original_imgs, original_imgs_shape,dtype=fm_class.data_type)
     original_imgs_np[:] = imgs
-    # remake the wvs array as a shared array first to get unique_wvs in the same data format
-    fm_class.wvs_dtype = np.ctypeslib.as_ctypes_type(wvs.dtype) # special: preserve wavelength dtype
-    wvs_imgs = mp.Array(fm_class.wvs_dtype, np.size(wvs) )
-    wvs_imgs_np = _arraytonumpy(wvs_imgs, dtype=fm_class.wvs_dtype) 
-    wvs_imgs_np[:] = wvs
-    unique_wvs = np.unique(wvs_imgs_np)
     # make array for recentered/rescaled image for each wavelength
+    unique_wvs = np.unique(wvs)
     recentered_imgs = mp.Array(fm_class.data_type, np.size(imgs)*np.size(unique_wvs))
     recentered_imgs_shape = (np.size(unique_wvs),) + imgs.shape
-    # remake the PA and center arrays as shared arrays
+
+    # remake the PA, wv, and center arrays as shared arrays
     pa_imgs = mp.Array(fm_class.data_type, np.size(parangs))
     pa_imgs_np = _arraytonumpy(pa_imgs,dtype=fm_class.data_type)
     pa_imgs_np[:] = parangs
+    wvs_imgs = mp.Array(fm_class.data_type, np.size(wvs))
+    wvs_imgs_np = _arraytonumpy(wvs_imgs,dtype=fm_class.data_type)
+    wvs_imgs_np[:] = wvs
     centers_imgs = mp.Array(fm_class.data_type, np.size(centers))
     centers_imgs_np = _arraytonumpy(centers_imgs, centers.shape,dtype=fm_class.data_type)
     centers_imgs_np[:] = centers
-    # mask centers
-    centers_mask = mp.Array(fm_class.data_type, np.size(centers))
-    centers_mask_np = _arraytonumpy(centers_mask, mask_centers.shape, dtype=fm_class.data_type)
-    centers_mask_np[:] = mask_centers
 
     if psf_library is not None:
         psf_lib = mp.Array(fm_class.data_type, np.size(psf_library))
@@ -1244,14 +1345,13 @@ def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, 
     tpool = mp.Pool(processes=numthreads, initializer=_tpool_init,
                     initargs=(original_imgs, original_imgs_shape, recentered_imgs, recentered_imgs_shape, output_imgs,
                               output_imgs_shape, output_imgs_numstacked, pa_imgs, wvs_imgs, centers_imgs, None, None,
-                              fmout_data, fmout_shape,perturbmag,perturbmag_shape, psf_lib, psf_lib_shape, centers_mask), 
-                    maxtasksperchild=50)
+                              fmout_data, fmout_shape,perturbmag,perturbmag_shape, psf_lib, psf_lib_shape), maxtasksperchild=50)
 
     # # SINGLE THREAD DEBUG PURPOSES ONLY
     if debug :
         _tpool_init(original_imgs, original_imgs_shape, recentered_imgs, recentered_imgs_shape, output_imgs,
                     output_imgs_shape, output_imgs_numstacked, pa_imgs, wvs_imgs, centers_imgs, None, None,
-                    fmout_data, fmout_shape,perturbmag,perturbmag_shape, psf_lib, psf_lib_shape, centers_mask)
+                    fmout_data, fmout_shape,perturbmag,perturbmag_shape, psf_lib, psf_lib_shape)
 
 
 
@@ -1259,14 +1359,11 @@ def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, 
     aligned_outputs = []
     for threadnum in range(numthreads):
         #multitask this
-        aligned_outputs += [tpool.apply_async(_align_and_scale_subset, args=(threadnum, aligned_center,numthreads,fm_class.data_type, fm_class.wvs_dtype))]
+        aligned_outputs += [tpool.apply_async(_align_and_scale_subset, args=(threadnum, aligned_center,numthreads,fm_class.data_type))]
 
         #save it to shared memory
     for aligned_output in aligned_outputs:
         aligned_output.wait()
-    
-    # update mask center after shift
-    centers_mask_np += (aligned_center - centers_imgs_np)
 
     print("Align and scale finished")
 
@@ -1310,11 +1407,11 @@ def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, 
         for wv_index, wv_value in enumerate(unique_wvs):
 
             # pick out the science images that need PSF subtraction for this wavelength
-            scidata_indicies = np.where(wvs_imgs_np == wv_value)[0]
+            scidata_indicies = np.where(wvs == wv_value)[0]
 
             # perform KLIP asynchronously for each group of files of a specific wavelength and section of the image
             sector_job_queued[sector_index] += scidata_indicies.shape[0]
-            if not debug: 
+            if not debug:
                 tpool_outputs += [tpool.apply_async(_klip_section_multifile_perfile,
                                                     args=(file_index, sector_index, radstart, radend, phistart, phiend,
                                                           parang, wv_value, wv_index, (radstart + radend) / 2., padding,(IWA,OWA),
@@ -1377,7 +1474,7 @@ def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, 
         # Let's take the mean based on number of images stacked at a location
         sub_imgs = _arraytonumpy(output_imgs, output_imgs_shape,dtype=fm_class.data_type)
         sub_imgs_numstacked = _arraytonumpy(output_imgs_numstacked, original_imgs_shape, dtype=ctypes.c_int)
-        
+
         # Remove annoying RuntimeWarnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -1417,6 +1514,8 @@ def klip_parallelized(imgs, centers, parangs, wvs, IWA, fm_class, mask_centers, 
 
     # Output for the sole PSFs
     return sub_imgs, fmout_np, perturbmag_np, aligned_center, noise_imgs
+
+
 
 
 
@@ -1508,13 +1607,10 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
     #note that numpy.cov normalizes by p-1 to get the NxN covariance matrix
     #we have to correct for that in the klip.klip_math routine when consturcting the KL
     #vectors since that's not part of the equation in the KLIP paper
-    if ref_psfs_mean_sub.shape[0] == 1:
-        covar_psfs = np.array([[np.cov(ref_psfs_mean_sub)]])
-    else:
-        covar_psfs = np.cov(ref_psfs_mean_sub)
+    covar_psfs = np.cov(ref_psfs_mean_sub)
 
     if corr_smooth > 0:
-        # calcualte the correlation matrix, with possible smoothing  
+        # calcualte the correlation matrix, with possible smoothing
         aligned_imgs_3d = aligned_imgs.reshape([aligned_imgs.shape[0], aligned_shape[-2], aligned_shape[-1]]) # make a cube that's not flattened in spatial dimension
         # smooth only the square that encompasses the segment
         # we need to figure where that is
@@ -1543,10 +1639,8 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
             # smoothing could have caused some ref images to have all 0s
             # which would give them correlation matrix entries of NaN
             # 0 them out for now.
-            if len(ref_psfs_smoothed) == 1:
-                corr_psfs = np.array([corr_psfs])
             corr_psfs[np.where(np.isnan(corr_psfs))] = 0
-            
+
     else:
         # if we don't smooth, we can use the covariance matrix to calculate the correlation matrix. It'll be slightly faster
         #also calculate correlation matrix since we'll use that to select reference PSFs
@@ -1562,7 +1656,7 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
 
     # grab the files suitable for reference PSF
     # load shared arrays for wavelengths and PAs
-    wvs_imgs = _arraytonumpy(img_wv,dtype=fm_class.wvs_dtype)
+    wvs_imgs = _arraytonumpy(img_wv,dtype=fm_class.data_type)
     pa_imgs = _arraytonumpy(img_pa,dtype=fm_class.data_type)
     # calculate average movement in this section for each PSF reference image w.r.t the science image
     moves = klip.estimate_movement(avg_rad, parang, pa_imgs, wavelength, wvs_imgs, mode)
@@ -1594,11 +1688,8 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
     # if no ADI, don't use other parallactic angles
     if "ADI" not in mode.upper():
         goodmv = (goodmv) & (pa_imgs == parang)
-    # if both aren't in here, we shouldn't be using any frames in the sequence
-    if "ADI" not in mode.upper() and "SDI" not in mode.upper():
-        goodmv = (goodmv) & False
     include_rdi = "RDI" in mode.upper()
-    
+
     # if minrot > 0:
     #     file_ind = np.where((moves >= minmove) & (np.abs(pa_imgs - parang) >= minrot))
     # else:
@@ -1632,7 +1723,7 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
     numwv = np.size(unique_wvs)
     # numcubes = np.size(wvs_imgs)/numwv
     numpix = np.shape(section_ind)[1]
-    
+
     rdi_psfs_selected = None # by default, no RDI images unless include_rdi
 
     if maxbasis_possible > maxbasis_requested:
@@ -1641,13 +1732,13 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
             # calculate real xcorr between image and RDI PSFs for this sector for only the maxnumbasis
             # best reference PSFs.
             # grab the maxnumbasis most correlated PSFs from the library
-            
+
             num_rdi_psfs_first_downselect = np.min([maxnumbasis, num_good_rdi])
             rdi_best_corr_max_possbile_indices = np.argsort(psflib_corr[img_num, psflib_good])[-num_rdi_psfs_first_downselect:]
             # grab these PSFs
             rdi_best_corr_max_possible = psf_library[psflib_good[rdi_best_corr_max_possbile_indices]]
             rdi_best_corr_max_possible = rdi_best_corr_max_possible[:, section_ind[0]]
-            
+
             # recalculate their correlations in this sector
             sci_img = aligned_imgs[img_num, section_ind[0]].reshape(1, numpix)
             # to calculate correlation, first subtract off mean for each image
@@ -1669,10 +1760,10 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
             psfindices = np.append(np.arange(np.size(xcorr)), psflib_good[rdi_best_corr_max_possbile_indices])
             # cross correlation now includes both
             xcorr = np.append(xcorr, sci_x_rdi_best_corr)
-        
+
         sort_ind = np.argsort(xcorr)
         closest_matched = sort_ind[-maxbasis_requested:]  # sorted smallest first so need to grab from the end
-        
+
         if include_rdi:
             # separate out the RDI ones
             rdi_selected = np.where(is_rdi_psf[closest_matched])
@@ -1685,11 +1776,11 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
         # grab smaller set of reference PSFs
         ref_psfs_selected = ref_psfs[file_ind[0][closest_matched], :]
         ref_psfs_indicies = file_ind[0][closest_matched]
-        
+
         if include_rdi:
             rdi_psfs_selected = psf_library[rdi_closest_matched]
             rdi_psfs_selected = rdi_psfs_selected[:, section_ind[0]]
-    
+
     else:
         # else just grab the reference PSFs for all the valid files
         ref_psfs_selected = ref_psfs[file_ind[0], :]
@@ -1697,20 +1788,20 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
 
         if include_rdi:
             rdi_psfs_selected = psf_library[psflib_good][:, section_ind[0]]
-    
+
 
     # grab PAs and wvs of reference images for forward modeling
     pa_refimgs = pa_imgs[ref_psfs_indicies]
     wvs_refimgs = wvs_imgs[ref_psfs_indicies]
 
-    # create a list that tracks with reference PSFs are RDI psfs. 1 if RDI PSF, 0 if not. 
+    # create a list that tracks with reference PSFs are RDI psfs. 1 if RDI PSF, 0 if not.
     # here, the list is created with just ADI/RDI PSFs first before we merge in the RDI files
     ref_rdi_indices = np.zeros(ref_psfs_selected.shape[0])
 
     # add PSF library to reference psf list and covariance matrix if needed
     if include_rdi:
 
-        #subctract the mean and remove the Nans from the RDI PSFs 
+        #subctract the mean and remove the Nans from the RDI PSFs
         rdi_psfs_selected_meansub = rdi_psfs_selected - np.nanmean(rdi_psfs_selected, axis=1)[:, None]
         rdi_psfs_selected_meansub[np.where(np.isnan(rdi_psfs_selected_meansub))] = 0
 
@@ -1727,12 +1818,12 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
         # [ cov_ref, cov_ref_x_rdi ]
         # [ cov_rdi_x_ref, cov_rdi ]
         # first append the horizontal component to get shape of N_all_refs x N_dataset_ref
-        
+
         covar_files = np.append(covar_files, covar_ref_x_rdi, axis=1)
         # now append the bottom half
         covar_files_bottom = np.append(covar_ref_x_rdi.T, rdi_covar, axis=1)
         covar_files = np.append(covar_files, covar_files_bottom, axis=0)
-        
+
 
 
         # append the rdi psfs to the reference PSFs
@@ -1772,31 +1863,30 @@ def _klip_section_multifile_perfile(img_num, sector_index, radstart, radend, phi
                                       radstart, radend, phistart, phiend, padding,IOWA, ref_center, flipx=flipx)
 
 
-    # load mask centers for forward modeling
-    centers_mask = _arraytonumpy(mask_centers, (np.size(wvs_imgs),2), dtype=fm_class.data_type)
-
     # call FM Class to handle forward modelling if it wants to. Basiclaly we are passing in everything as a variable
     # and it can choose which variables it wants to deal with using **kwargs
     # result is stored in fmout
-    # TODO: ref_psfs_indices is being used, but not generalizable to RDI. pa_imgs and wv_imgs are being passed in as all zeros. 
-    # possibly solution: edit pa_imgs, and wv_imgs to include the RDI frames. Maybe also append ref_psf_indices. spectrallib in fmclasses only interpolate nonzeros for ADI/SDI. 
+    # TODO: ref_psfs_indices is being used, but not generalizable to RDI. pa_imgs and wv_imgs are being passed in as all zeros.
+    # possibly solution: edit pa_imgs, and wv_imgs to include the RDI frames. Maybe also append ref_psf_indices. spectrallib in fmclasses only interpolate nonzeros for ADI/SDI.
     fm_class.fm_from_eigen(klmodes=original_KL, evals=evals, evecs=evecs,
                            input_img_shape=[original_shape[1], original_shape[2]], input_img_num=img_num,
                            ref_psfs_indicies=ref_psfs_indicies, section_ind=section_ind,
                            section_ind_nopadding=section_ind_nopadding, aligned_imgs=aligned_imgs,
                            pas=pa_refimgs, wvs=wvs_refimgs, radstart=radstart,
-                           radend=radend, phistart=phistart, phiend=phiend, padding=padding, IOWA = IOWA, 
+                           radend=radend, phistart=phistart, phiend=phiend, padding=padding, IOWA = IOWA,
                            ref_center=ref_center, parang=parang, ref_wv=wavelength, numbasis=numbasis,
-                           maxnumbasis=maxnumbasis, fmout=fmout_np, output_img_shape = outputs_shape, perturbmag = perturbmag_np,klipped=klipped, 
-                           covar_files=covar_files, flipx=flipx, mode=mode, rdi_psfs=rdi_psfs_selected, mask_centers=centers_mask)
+                           maxnumbasis=maxnumbasis, fmout=fmout_np, output_img_shape = outputs_shape, perturbmag = perturbmag_np,klipped=klipped,
+                           covar_files=covar_files, flipx=flipx, mode=mode, rdi_psfs=rdi_psfs_selected)
 
     return sector_index
 
 
+
+
 def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="pyklipfm", annuli=5, subsections=4,
                  OWA=None, N_pix_sector=None, movement=None, flux_overlap=0.1, PSF_FWHM=3.5, minrot=0, padding=0,
-                 numbasis=None, maxnumbasis=None, numthreads=None, corr_smooth=1, calibrate_flux=False, aligned_center=None, 
-                 psf_library=None, spectrum=None, highpass=False, annuli_spacing="constant", save_klipped=True, 
+                 numbasis=None, maxnumbasis=None, numthreads=None, corr_smooth=1, calibrate_flux=False, aligned_center=None,
+                 psf_library=None, spectrum=None, highpass=False, annuli_spacing="constant", save_klipped=True,
                  mute_progression=False, time_collapse="mean"):
     """
     Run KLIP-FM on a dataset object
@@ -1847,7 +1937,7 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
                     if smaller than 10%, (hard coded quantity), then use it for reference PSF
         highpass:       if True, run a Gaussian high pass filter (default size is sigma=imgsize/10)
                             can also be a number specifying FWHM of box in pixel units
-        annuli_spacing: how to distribute the annuli radially. Currently three options. Constant (equally spaced), 
+        annuli_spacing: how to distribute the annuli radially. Currently three options. Constant (equally spaced),
                         log (logarithmical expansion with r), and linear (linearly expansion with r)
         save_klipped: if True, will save the regular klipped image. If false, it wil not and sub_imgs will return None
         mute_progression: Mute the printing of the progression percentage. Indeed sometimes the overwriting feature
@@ -1870,12 +1960,9 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
             numbasis = np.array(numbasis)
         else:
             numbasis = np.array([numbasis])
-        # check that numbasis has only integers
-        if numbasis.dtype.kind not in ("i", "u"):
-            raise TypeError("numbasis should be an integer array, but got array of type {0}".format(numbasis.dtype))
 
     # check how we will collapse the data
-    valid_time_collapse = ["mean", "weighted-mean"]
+    valid_time_collapse = ["mean", "weighted-mean","median"]
     if not time_collapse.lower() in valid_time_collapse:
         raise ValueError("Cannot collpase data using {0}. Valid options are {1}".format(time_collapse, valid_time_collapse))
     time_collapse = time_collapse.lower()
@@ -1890,8 +1977,10 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
             raise ValueError("You need to pass in a psf_library if you want to run RDI")
         if psf_library.dataset is not dataset:
             raise ValueError("The PSF Library is not prepared for this dataset. Run psf_library.prepare_library()")
+        if highpass != psf_library.highpass:
+            raise ValueError("Highpass filter for the PSF Library and the dataset need to be the same")
         if aligned_center is not None:
-            if not np.array_equal(aligned_center, psf_library.aligned_center): 
+            if not np.array_equal(aligned_center, psf_library.aligned_center):
                 raise ValueError("The images need to be aligned to the same center as the RDI Library")
         else:
             aligned_center = psf_library.aligned_center
@@ -1904,7 +1993,7 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
         rdi_corr_matrix = None
         rdi_good_psfs = None
 
-    
+
 
     # high pass filter?
     if isinstance(highpass, bool):
@@ -1971,8 +2060,8 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
         mkl.set_num_threads(1)
 
     klip_outputs = klip_parallelized(dataset.input, dataset.centers, dataset.PAs, dataset.wvs, dataset.IWA, fm_class,
-                                     dataset.mask_centers, OWA=OWA, mode=mode, annuli=annuli, subsections=subsections, 
-                                     movement=movement, flux_overlap=flux_overlap, PSF_FWHM=PSF_FWHM, numbasis=numbasis,
+                                     OWA=OWA, mode=mode, annuli=annuli, subsections=subsections, movement=movement,
+                                     flux_overlap=flux_overlap, PSF_FWHM=PSF_FWHM, numbasis=numbasis,
                                      maxnumbasis=maxnumbasis, corr_smooth=corr_smooth,
                                      aligned_center=aligned_center, numthreads=numthreads,
                                      minrot=minrot, spectrum=spectra_template, padding=padding, save_klipped=True,
@@ -1986,11 +2075,11 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
     dataset.perturbmag = perturbmag
     # save output centers here
     dataset.output_centers = np.array([klipped_center for _ in range(klipped.shape[1])])
-    
+
     numwvs = dataset.numwvs
 
     # pixel weights for weighted mean
-    pixel_weights = 1./stddev_frames**2           
+    pixel_weights = 1./stddev_frames**2
     if weighted:
         pixel_weights = pixel_weights.reshape([klipped.shape[0], klipped.shape[1]//numwvs, numwvs,
                                         klipped.shape[2], klipped.shape[3]]) # (b, N_cube, wvs, y, x) 5-D cube
@@ -2010,7 +2099,7 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
         # store it in the dataset object
         dataset.output = klipped
 
-        # 5-D cube 
+        # 5-D cube
         klipped = klipped.reshape([klipped.shape[0], klipped.shape[1]//numwvs, numwvs,
                                         klipped.shape[2], klipped.shape[3]]) # (b, N_cube, wvs, y, x) 5-D cube
 
@@ -2024,7 +2113,10 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
             # Remove annoying RuntimeWarnings
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
-                KLmode_cube = np.nanmean(pixel_weights * klipped, axis=(1,2))
+                if time_collapse == 'median':
+                    KLmode_cube = np.nanmedian(klipped, axis=(1,2))
+                else:
+                    KLmode_cube = np.nanmean(pixel_weights * klipped, axis=(1,2))
             if weighted:
                 # if the pixel weights aren't just 1 (i.e., weighted case), we need to normalize for that
                 KLmode_cube /= np.nanmean(pixel_weights, axis=(1,2))
@@ -2046,7 +2138,7 @@ def klip_dataset(dataset, fm_class, mode="ADI+SDI", outputdir=".", fileprefix="p
             # for each KL mode, collapse in time to examine spectra
             KLmode_spectral_cubes = np.nanmean(pixel_weights * klipped, axis=1)
             if weighted:
-                # if the pixel weights aren't just 1 (i.e., weighted case), we need to normalize for that. 
+                # if the pixel weights aren't just 1 (i.e., weighted case), we need to normalize for that.
                 KLmode_spectral_cubes /= np.nanmean(pixel_weights, axis=1)
 
             for KLcutoff, spectral_cube in zip(numbasis, KLmode_spectral_cubes):
