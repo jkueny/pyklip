@@ -696,56 +696,57 @@ class DiskFM(NoFM):
             file_extension = ""
         else:
             _, file_extension = path.splitext(self.basis_filename)
-        manager = mp.Manager()
 
+        # Plain dicts: fm_parallelized runs serially, and mp.Manager proxies would
+        # copy the full aligned image cube on every access.
         # Load in file
         if file_extension == ".pkl":
             pkl_file = open(self.basis_filename, "rb")
             if version_info.major == 3:
                 # Using encoding='latin1' is required for unpickling NumPy arrays
                 # and instances of datetime, date and time pickled by Python 2.
-                self.aligned_images_dict = manager.dict(
+                self.aligned_images_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
 
-                self.klmodes_dict = manager.dict(
+                self.klmodes_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
-                self.evecs_dict = manager.dict(
+                self.evecs_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
-                self.evals_dict = manager.dict(
+                self.evals_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
-                self.ref_psfs_indicies_dict = manager.dict(
+                self.ref_psfs_indicies_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
-                self.section_ind_dict = manager.dict(
+                self.section_ind_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
 
-                self.radstart_dict = manager.dict(
+                self.radstart_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
-                self.radend_dict = manager.dict(
+                self.radend_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
-                self.phistart_dict = manager.dict(
+                self.phistart_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
-                self.phiend_dict = manager.dict(
+                self.phiend_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
-                self.input_img_num_dict = manager.dict(
+                self.input_img_num_dict = dict(
                     pickle.load(pkl_file, encoding="latin1"))
 
                 self.klparam_dict = pickle.load(pkl_file, encoding="latin1")
 
             else:
-                self.aligned_images_dict = manager.dict(pickle.load(pkl_file))
+                self.aligned_images_dict = dict(pickle.load(pkl_file))
 
-                self.klmodes_dict = manager.dict(pickle.load(pkl_file))
-                self.evecs_dict = manager.dict(pickle.load(pkl_file))
-                self.evals_dict = manager.dict(pickle.load(pkl_file))
-                self.ref_psfs_indicies_dict = manager.dict(
+                self.klmodes_dict = dict(pickle.load(pkl_file))
+                self.evecs_dict = dict(pickle.load(pkl_file))
+                self.evals_dict = dict(pickle.load(pkl_file))
+                self.ref_psfs_indicies_dict = dict(
                     pickle.load(pkl_file))
-                self.section_ind_dict = manager.dict(pickle.load(pkl_file))
+                self.section_ind_dict = dict(pickle.load(pkl_file))
 
-                self.radstart_dict = manager.dict(pickle.load(pkl_file))
-                self.radend_dict = manager.dict(pickle.load(pkl_file))
-                self.phistart_dict = manager.dict(pickle.load(pkl_file))
-                self.phiend_dict = manager.dict(pickle.load(pkl_file))
-                self.input_img_num_dict = manager.dict(pickle.load(pkl_file))
+                self.radstart_dict = dict(pickle.load(pkl_file))
+                self.radend_dict = dict(pickle.load(pkl_file))
+                self.phistart_dict = dict(pickle.load(pkl_file))
+                self.phiend_dict = dict(pickle.load(pkl_file))
+                self.input_img_num_dict = dict(pickle.load(pkl_file))
 
                 self.klparam_dict = pickle.load(pkl_file)
 
@@ -754,21 +755,21 @@ class DiskFM(NoFM):
             if file_extension == ".h5":
                 kl_basis_file = _load_dict_from_hdf5(self.basis_filename)
 
-        self.aligned_images_dict = manager.dict(
+        self.aligned_images_dict = dict(
             kl_basis_file['aligned_images_dict'])
 
-        self.klmodes_dict = manager.dict(kl_basis_file['klmodes_dict'])
-        self.evecs_dict = manager.dict(kl_basis_file['evecs_dict'])
-        self.evals_dict = manager.dict(kl_basis_file['evals_dict'])
-        self.ref_psfs_indicies_dict = manager.dict(
+        self.klmodes_dict = dict(kl_basis_file['klmodes_dict'])
+        self.evecs_dict = dict(kl_basis_file['evecs_dict'])
+        self.evals_dict = dict(kl_basis_file['evals_dict'])
+        self.ref_psfs_indicies_dict = dict(
             kl_basis_file['ref_psfs_indicies_dict'])
-        self.section_ind_dict = manager.dict(kl_basis_file['section_ind_dict'])
+        self.section_ind_dict = dict(kl_basis_file['section_ind_dict'])
 
-        self.radstart_dict = manager.dict(kl_basis_file['radstart_dict'])
-        self.radend_dict = manager.dict(kl_basis_file['radend_dict'])
-        self.phistart_dict = manager.dict(kl_basis_file['phistart_dict'])
-        self.phiend_dict = manager.dict(kl_basis_file['phiend_dict'])
-        self.input_img_num_dict = manager.dict(
+        self.radstart_dict = dict(kl_basis_file['radstart_dict'])
+        self.radend_dict = dict(kl_basis_file['radend_dict'])
+        self.phistart_dict = dict(kl_basis_file['phistart_dict'])
+        self.phiend_dict = dict(kl_basis_file['phiend_dict'])
+        self.input_img_num_dict = dict(
             kl_basis_file['input_img_num_dict'])
 
         self.klparam_dict = kl_basis_file['klparam_dict']
