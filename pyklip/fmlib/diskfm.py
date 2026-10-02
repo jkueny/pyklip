@@ -381,17 +381,21 @@ class DiskFM(NoFM):
         # use the disk model stored
         model_sci = self.model_disks[input_img_num, section_ind[0]]
         model_sci[np.isnan(model_sci)] = 0
-        model_ref = self.model_disks[ref_psfs_indicies, :]
-        model_ref = model_ref[:, section_ind[0]]
-        model_ref[np.isnan(model_ref)] = 0
         if mode == 'RDI':
             #if only RDI we skip the deltaKL calculation since we do only over-subctraction
             delta_KL = klmodes * 0.
         else:
+            # project the reference models on the eigenvectors with one product over all frames
+            # (zero weight for non-reference frames) instead of copying the reference rows of
+            # model_disks for each section. update_disk already set the NaNs of model_disks to 0.
+            evecs_all = np.zeros((self.model_disks.shape[0], evecs.shape[1]))
+            np.add.at(evecs_all, ref_psfs_indicies, evecs)
+            evecs_models = evecs_all.T.dot(self.model_disks)[:, section_ind[0]]
             # using original Kl modes and reference models, compute the perturbed KL modes
             # (spectra is already in models). The KL modes come from fm.klip_math, so the
             # reference images are not needed.
-            delta_KL = fm.perturb_specIncluded_from_KL(evals, evecs, klmodes, model_ref)
+            delta_KL = fm.perturb_specIncluded_from_KL(evals, evecs, klmodes,
+                                                       evecs_models=evecs_models)
 
         # calculate postklip_psf using delta_KL
         postklip_psf, _, _ = fm.calculate_fm(delta_KL,

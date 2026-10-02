@@ -214,14 +214,14 @@ def perturb_specIncluded(evals, evecs, original_KL, refs, models_ref, return_per
         return delta_KL
 
 
-def perturb_specIncluded_from_KL(evals, evecs, original_KL, models_ref):
+def perturb_specIncluded_from_KL(evals, evecs, original_KL, models_ref=None, evecs_models=None):
     """
     Same as perturb_specIncluded() but computed from the KL modes instead of the reference images. Much quicker,
     since the N x N perturbed covariance matrix over all p pixels is never formed.
 
     Only valid if original_KL was built from the eigenvectors as in klip_math(), i.e.
     original_KL = (refs_mean_sub.T . evecs / sqrt(evals)).T, so that refs_mean_sub.T . evecs = original_KL.T * sqrt(evals)
-    and alpha = evecs.T \cdot C \cdot evecs can be computed without the reference images.
+    and alpha = evecs.T *dot* C *dot* evecs can be computed without the reference images.
 
     Args:
         evals: array of eigenvalues of the reference PSF covariance matrix (array of size numbasis)
@@ -229,19 +229,22 @@ def perturb_specIncluded_from_KL(evals, evecs, original_KL, models_ref):
         orignal_KL: unpertrubed KL modes from klip_math() (array of size [numbasis, p])
         models_ref: N x p array of the N models corresponding to reference images.
                     Each model should contain spectral informatoin
+        evecs_models: optional, precomputed evecs.T . models_ref (array of size [numbasis, p]) with the NaNs of
+                      models_ref set to 0. If given, models_ref is not used.
 
     Returns:
         delta_KL: perturbed KL modes. Shape is (numKL, pix)
     """
     max_basis = original_KL.shape[0]
 
-    models_mean_sub = models_ref # - np.nanmean(models_ref, axis=1)[:,None] should this be the case?
-    models_mean_sub[np.isnan(models_mean_sub)] = 0
+    if evecs_models is None:
+        models_mean_sub = models_ref # - np.nanmean(models_ref, axis=1)[:,None] should this be the case?
+        models_mean_sub[np.isnan(models_mean_sub)] = 0
+        evecs_models = (evecs.transpose()).dot(models_mean_sub)
 
     beta, evals_sqrt, evalse_inv_sqrt = _perturb_beta(evals, max_basis)
 
     # alpha = evecs.T . (models . refs.T + refs . models.T) . evecs, with refs.T . evecs = original_KL.T * sqrt(evals)
-    evecs_models = (evecs.transpose()).dot(models_mean_sub)
     alpha_partial = evecs_models.dot(original_KL.transpose() * evals_sqrt[None,:])
     alpha = alpha_partial + alpha_partial.transpose()
 

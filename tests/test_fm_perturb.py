@@ -50,3 +50,25 @@ def test_perturb_from_KL_matches_refs(nan_frac, badpix_frac, n_wv, numbasis):
     assert delta_KL_kl.shape == delta_KL_refs.shape
     assert np.all(np.isfinite(delta_KL_kl))
     assert np.allclose(delta_KL_kl, delta_KL_refs, rtol=1e-10, atol=1e-10 * np.abs(delta_KL_refs).max())
+
+
+def test_perturb_from_KL_precomputed_evecs_models():
+    """DiskFM passes evecs.T . models_ref computed over all frames, with zero weight for non-reference frames"""
+    sci, refs, models = make_section(nan_frac=0.3, badpix_frac=0.01, n_wv=2)
+    _, klmodes, evals, evecs = fm.klip_math(sci, refs, np.array([10]))
+
+    # all frames of the sequence: the references are a shuffled subset of them
+    rng = np.random.default_rng(1)
+    n_frames = refs.shape[0] + 15
+    ref_indices = rng.permutation(n_frames)[:refs.shape[0]]
+    model_frames = np.abs(rng.normal(size=(n_frames, models.shape[1])))
+    model_frames[ref_indices] = np.nan_to_num(models)
+
+    evecs_all = np.zeros((n_frames, evecs.shape[1]))
+    np.add.at(evecs_all, ref_indices, evecs)
+    evecs_models = evecs_all.T.dot(model_frames)
+
+    delta_KL_refs = fm.perturb_specIncluded(evals, evecs, klmodes, refs, models.copy())
+    delta_KL_kl = fm.perturb_specIncluded_from_KL(evals, evecs, klmodes, evecs_models=evecs_models)
+
+    assert np.allclose(delta_KL_kl, delta_KL_refs, rtol=1e-10, atol=1e-10 * np.abs(delta_KL_refs).max())
