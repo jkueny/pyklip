@@ -199,15 +199,7 @@ def perturb_specIncluded(evals, evecs, original_KL, refs, models_ref, return_per
 
     #print(evals.shape,evecs.shape,original_KL.shape,refs.shape,models_ref.shape)
 
-    evals_tiled = np.tile(evals,(max_basis,1))
-    np.fill_diagonal(evals_tiled,np.nan)
-    evals_sqrt = np.sqrt(evals)
-    evalse_inv_sqrt = 1./evals_sqrt
-    evals_ratio = (evalse_inv_sqrt[:,None]).dot(evals_sqrt[None,:])
-    beta_tmp = 1./(evals_tiled.transpose()- evals_tiled)
-    #print(evals)
-    beta_tmp[np.diag_indices(np.size(evals))] = -0.5/evals
-    beta = evals_ratio*beta_tmp
+    beta, _, evalse_inv_sqrt = _perturb_beta(evals, max_basis)
 
     C_partial = models_mean_sub.dot(refs_mean_sub.transpose())
     C = C_partial+C_partial.transpose()
@@ -220,6 +212,66 @@ def perturb_specIncluded(evals, evecs, original_KL, refs, models_ref, return_per
         return delta_KL, C
     else:
         return delta_KL
+
+
+def perturb_specIncluded_from_KL(evals, evecs, original_KL, models_ref):
+    """
+    Same as perturb_specIncluded() but computed from the KL modes instead of the reference images. Much quicker,
+    since the N x N perturbed covariance matrix over all p pixels is never formed.
+
+    Only valid if original_KL was built from the eigenvectors as in klip_math(), i.e.
+    original_KL = (refs_mean_sub.T . evecs / sqrt(evals)).T, so that refs_mean_sub.T . evecs = original_KL.T * sqrt(evals)
+    and alpha = evecs.T \cdot C \cdot evecs can be computed without the reference images.
+
+    Args:
+        evals: array of eigenvalues of the reference PSF covariance matrix (array of size numbasis)
+        evecs: corresponding eigenvectors (array of size [N, numbasis])
+        orignal_KL: unpertrubed KL modes from klip_math() (array of size [numbasis, p])
+        models_ref: N x p array of the N models corresponding to reference images.
+                    Each model should contain spectral informatoin
+
+    Returns:
+        delta_KL: perturbed KL modes. Shape is (numKL, pix)
+    """
+    max_basis = original_KL.shape[0]
+
+    models_mean_sub = models_ref # - np.nanmean(models_ref, axis=1)[:,None] should this be the case?
+    models_mean_sub[np.isnan(models_mean_sub)] = 0
+
+    beta, evals_sqrt, evalse_inv_sqrt = _perturb_beta(evals, max_basis)
+
+    # alpha = evecs.T . (models . refs.T + refs . models.T) . evecs, with refs.T . evecs = original_KL.T * sqrt(evals)
+    evecs_models = (evecs.transpose()).dot(models_mean_sub)
+    alpha_partial = evecs_models.dot(original_KL.transpose() * evals_sqrt[None,:])
+    alpha = alpha_partial + alpha_partial.transpose()
+
+    delta_KL = (beta*alpha).dot(original_KL) + evalse_inv_sqrt[:,None]*evecs_models
+
+    return delta_KL
+
+
+def _perturb_beta(evals, max_basis):
+    """
+    Eigenvalue-dependent coefficients shared by perturb_specIncluded() and perturb_specIncluded_from_KL()
+
+    Args:
+        evals: array of eigenvalues of the reference PSF covariance matrix (array of size numbasis)
+        max_basis: number of KL modes
+
+    Returns:
+        beta: (max_basis, max_basis) array of perturbation coefficients
+        evals_sqrt: sqrt(evals)
+        evalse_inv_sqrt: 1/sqrt(evals)
+    """
+    evals_tiled = np.tile(evals,(max_basis,1))
+    np.fill_diagonal(evals_tiled,np.nan)
+    evals_sqrt = np.sqrt(evals)
+    evalse_inv_sqrt = 1./evals_sqrt
+    evals_ratio = (evalse_inv_sqrt[:,None]).dot(evals_sqrt[None,:])
+    beta_tmp = 1./(evals_tiled.transpose()- evals_tiled)
+    beta_tmp[np.diag_indices(np.size(evals))] = -0.5/evals
+    beta = evals_ratio*beta_tmp
+    return beta, evals_sqrt, evalse_inv_sqrt
 
 
 def perturb_nospec_modelsBased(evals, evecs, original_KL, refs, models_ref_list):

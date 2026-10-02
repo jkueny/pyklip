@@ -369,8 +369,6 @@ class DiskFM(NoFM):
 
         if self.load_from_basis == False:
             sci = aligned_imgs[input_img_num, section_ind[0]]
-            refs = aligned_imgs[ref_psfs_indicies, :]
-            refs = refs[:, section_ind[0]]
         else:
             wlstrkey = 'wl' + str(int(self.wvs[input_img_num] * 1000)).zfill(4)
             sci = self.aligned_images_dict[wlstrkey][input_img_num,
@@ -391,29 +389,9 @@ class DiskFM(NoFM):
             delta_KL = klmodes * 0.
         else:
             # using original Kl modes and reference models, compute the perturbed KL modes
-            # (spectra is already in models)
-            if self.load_from_basis == False:
-                delta_KL = fm.perturb_specIncluded(
-                    evals,
-                    evecs,
-                    klmodes,
-                    refs,
-                    model_ref,
-                    return_perturb_covar=False,
-                )
-            else:
-                # in the case of load_from_basis, the images are already saved in the
-                # DiskFM object, we can save a few tens of Mbytes (per cpu) by not 
-                # saving them and just passing them to the nex function
-                delta_KL = fm.perturb_specIncluded(
-                    evals,
-                    evecs,
-                    klmodes,
-                    self.aligned_images_dict[wlstrkey][ref_psfs_indicies, :]
-                    [:, section_ind[0]],
-                    model_ref,
-                    return_perturb_covar=False,
-                )
+            # (spectra is already in models). The KL modes come from fm.klip_math, so the
+            # reference images are not needed.
+            delta_KL = fm.perturb_specIncluded_from_KL(evals, evecs, klmodes, model_ref)
 
         # calculate postklip_psf using delta_KL
         postklip_psf, _, _ = fm.calculate_fm(delta_KL,
